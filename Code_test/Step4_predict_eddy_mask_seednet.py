@@ -1,83 +1,56 @@
-import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.ndimage import label, find_objects
+import matplotlib.pyplot as plt
 
-# ====== 你需要改的路径 ======
-SSH_2011_NPY = r"data/testAVISO-SSH_2011.npy"              # (T,H,W) or (T,168,168)
-POS_GROW_2011 = r"data/facts_pos_grow_2011.npy"
-NEG_GROW_2011 = r"data/facts_neg_grow_2011.npy"
-OCEAN_2011    = r"data/facts_ocean_2011.npy"
+# ===== 路径：按你本地改 =====
+SEEDNET_PT = r"D:\Desktop\Neural Symbolic\Code\GITCode\EddyNN-DeepProblog\Code_test\Output_fasttrain\seednet_epoch5.pt"
 
-SEEDNET_PT = r"Output/model_seednet/seednet.pt"           # 建议你从训练脚本另存一个 torch state_dict
-OUT_PRED = r"Output/eddy_mask_pred_2011.npy"
+SSH_2011 = r"D:\Desktop\Neural Symbolic\Code\GITCode\EddyNN-DeepProblog\data\testAVISO-SSH_2011.npy"
+POS_GROW_2011 = r"D:\Desktop\Neural Symbolic\Code\GITCode\EddyNN-DeepProblog\data\facts\facts_pos_grow_2011.npy"
+NEG_GROW_2011 = r"D:\Desktop\Neural Symbolic\Code\GITCode\EddyNN-DeepProblog\data\facts\facts_neg_grow_2011.npy"
+OCEAN_2011    = r"D:\Desktop\Neural Symbolic\Code\GITCode\EddyNN-DeepProblog\data\facts\facts_ocean_2011.npy"
+GT_2011       = r"D:\Desktop\Neural Symbolic\Code\GITCode\EddyNN-DeepProblog\data\eddy_mask_2011.npy"
 
-# ====== 参数（要和你的 rule 一致）======
-MIN_AREA = 15
-MAX_AREA = 400
+DAY = 10          # 先随便挑一天
+TAU_KEEP = 0.5   # 阈值
+MIN_AREA, MAX_AREA = 15, 400
 PATCH = 32
-TAU_KEEP = 0.5              # 候选 keep 的阈值（先用0.5）
-CONNECTIVITY8 = True
 
-# ROI crop：和你其他脚本一致（168x168, y0=25, x0=280-168）
-Y0 = 25
-BOX = 168
-W_FULL = 280
-
-def crop_168_box(arr: np.ndarray, y0: int = Y0, box: int = BOX, w_full: int = W_FULL) -> np.ndarray:
-    x0 = w_full - box
-    if arr.ndim == 3:
-        return arr[:, y0:y0 + box, x0:x0 + box]
-    elif arr.ndim == 2:
-        return arr[y0:y0 + box, x0:x0 + box]
-    else:
-        raise ValueError(arr.shape)
-
-def maybe_crop_to_roi(arr: np.ndarray) -> np.ndarray:
-    # 若已经是 (T,168,168) 就不裁；否则按 (T, H>=193, W=280) 裁
-    if arr.ndim != 3:
-        raise ValueError(arr.shape)
+# 若你的 SSH 是 (T,H,280)，需要裁 ROI；若已是 (T,168,168) 则不裁
+Y0, BOX, W_FULL = 25, 168, 280
+def maybe_crop_to_roi(arr):
     if arr.shape[1] == BOX and arr.shape[2] == BOX:
         return arr
-    if arr.shape[2] == W_FULL and arr.shape[1] >= Y0 + BOX:
-        return crop_168_box(arr)
-    raise ValueError(f"Unexpected shape: {arr.shape}")
+    x0 = W_FULL - BOX
+    return arr[:, Y0:Y0+BOX, x0:x0+BOX]
 
-def normalize_patch(patch_img: np.ndarray, eps=1e-6, clip=5.0) -> np.ndarray:
-    patch_img = patch_img.astype(np.float32)
-    m = patch_img.mean()
-    s = patch_img.std()
-    if s < eps:
-        out = np.zeros_like(patch_img, dtype=np.float32)
-    else:
-        out = (patch_img - m) / (s + eps)
-    out = np.clip(out, -clip, clip)
-    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-    return out.astype(np.float32)
+def structure8():
+    return np.ones((3,3), dtype=int)
 
-def crop_centered_patch(img2d: np.ndarray, sl, patch=32) -> np.ndarray:
-    # sl 是 find_objects 给的 slice，代表该连通域的 bbox
+def crop_centered_patch(img2d, sl, patch=32):
     y0, y1 = sl[0].start, sl[0].stop
     x0, x1 = sl[1].start, sl[1].stop
     cy = (y0 + y1) // 2
     cx = (x0 + x1) // 2
     half = patch // 2
-
-    ys = max(0, cy - half); ye = min(img2d.shape[0], cy + half)
-    xs = max(0, cx - half); xe = min(img2d.shape[1], cx + half)
-
-    out = np.zeros((patch, patch), dtype=np.float32)
+    ys = max(0, cy-half); ye = min(img2d.shape[0], cy+half)
+    xs = max(0, cx-half); xe = min(img2d.shape[1], cx+half)
+    out = np.zeros((patch, patch), np.float32)
     out[(half-(cy-ys)):(half+(ye-cy)), (half-(cx-xs)):(half+(xe-cx))] = img2d[ys:ye, xs:xe]
     return out
 
-def structure(connectivity8=True):
-    if connectivity8:
-        return np.ones((3, 3), dtype=int)
-    return np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=int)
+def normalize_patch(p, eps=1e-6, clip=5.0):
+    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    m, s = p.mean(), p.std()
+    if s < eps:
+        return np.zeros_like(p, np.float32)
+    p = (p - m) / (s + eps)
+    p = np.clip(p, -clip, clip)
+    return p.astype(np.float32)
 
-# 你的 seednet 结构要与训练时一致
 class SeedNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -88,105 +61,133 @@ class SeedNet(nn.Module):
             nn.MaxPool2d(2),
             nn.Flatten(),
             nn.Linear(32 * 8 * 8, 64), nn.ReLU(),
-            nn.Linear(64, 2)
+            nn.Linear(64, 2),
         )
-
     def forward(self, x):
         logits = self.net(x)
-        probs = F.softmax(logits, dim=-1).clamp(1e-6, 1 - 1e-6)
-        return probs  # (B,2)
+        return F.softmax(logits, dim=-1)
 
 @torch.no_grad()
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def predict_mask_for_day(net, ssh2d, pos_grow2d, neg_grow2d, ocean2d, device):
+    H, W = ssh2d.shape
+    oc = ocean2d.astype(bool)
+    S = structure8()
 
-    ssh_raw = np.load(SSH_2011_NPY).astype(np.float32)
-    pos_grow_raw = np.load(POS_GROW_2011).astype(np.uint8)
-    neg_grow_raw = np.load(NEG_GROW_2011).astype(np.uint8)
-    ocean_raw    = np.load(OCEAN_2011).astype(np.uint8)
+    prob_pos = np.zeros((H,W), np.float32)
+    prob_neg = np.zeros((H,W), np.float32)
 
-    ssh = maybe_crop_to_roi(ssh_raw)
-    pos_grow = maybe_crop_to_roi(pos_grow_raw)
-    neg_grow = maybe_crop_to_roi(neg_grow_raw)
-    ocean    = maybe_crop_to_roi(ocean_raw)
+    def run_one(grow2d, prob_map):
+        grow = (grow2d.astype(bool) & oc)
+        lab, n = label(grow.astype(np.uint8), structure=S)
+        if n == 0:
+            return
+        areas = np.bincount(lab.ravel())
+        sls = find_objects(lab)
 
-    T, H, W = ssh.shape
-    print("ROI shape:", ssh.shape)
-
-    model = SeedNet().to(device)
-    sd = torch.load(SEEDNET_PT, map_location="cpu")
-    model.load_state_dict(sd)
-    model.eval()
-
-    S = structure(CONNECTIVITY8)
-
-    pred = np.zeros((T, H, W), dtype=np.int8)
-
-    # 为了处理 pos/neg 冲突，先记概率图
-    prob_pos = np.zeros((T, H, W), dtype=np.float32)
-    prob_neg = np.zeros((T, H, W), dtype=np.float32)
-
-    for t in range(T):
-        img = np.nan_to_num(ssh[t], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        oc = (ocean[t] > 0)
-
-        for sign, grow2d, prob_map, label_val in [
-            ("pos", pos_grow[t], prob_pos[t], 2),
-            ("neg", neg_grow[t], prob_neg[t], 1),
-        ]:
-            grow = (grow2d > 0) & oc
-            lab, n = label(grow.astype(np.uint8), structure=S)
-            if n == 0:
+        patches, metas = [], []
+        for cid in range(1, n+1):
+            area = int(areas[cid])
+            if area < MIN_AREA or area > MAX_AREA:
                 continue
-
-            areas = np.bincount(lab.ravel())
-            slices = find_objects(lab)
-
-            # 收集需要跑网络的候选
-            patches = []
-            metas = []  # (sl, region_mask, pmap_ref)
-
-            for cid in range(1, n + 1):
-                area = int(areas[cid])
-                if area < MIN_AREA or area > MAX_AREA:
-                    continue  # area_ok 不满足，keep 直接为0
-                sl = slices[cid - 1]
-                if sl is None:
-                    continue
-                region = (lab[sl] == cid)
-                if region.sum() == 0:
-                    continue
-
-                patch = crop_centered_patch(img, sl, patch=PATCH)
-                patch = normalize_patch(patch)
-                patches.append(patch[None, None, ...])  # (1,1,P,P)
-                metas.append((sl, region))
-
-            if not patches:
+            sl = sls[cid-1]
+            if sl is None:
                 continue
+            region = (lab[sl] == cid)
+            if region.sum() == 0:
+                continue
+            p = crop_centered_patch(ssh2d, sl, PATCH)
+            p = normalize_patch(p)
+            patches.append(p[None,None,...])
+            metas.append((sl, region))
 
-            batch = torch.from_numpy(np.concatenate(patches, axis=0)).to(device)  # (B,1,P,P)
-            probs = model(batch).detach().cpu().numpy()  # (B,2)
-            p_keep = probs[:, 1]  # P(seed_present=1) == P(keep)
+        if not patches:
+            return
 
-            # 回填到像素图（连通域内赋同一个 keep 概率）
-            for (sl, region), pk in zip(metas, p_keep):
-                if pk >= TAU_KEEP:
-                    # 注意：sl 局部赋值时要用 np.maximum 叠加
-                    block = prob_map[sl]
-                    block[region] = np.maximum(block[region], float(pk))
-                    prob_map[sl] = block
+        x = torch.from_numpy(np.concatenate(patches, axis=0)).to(device)
+        probs = net(x).cpu().numpy()
+        p_keep = probs[:,1]
 
-        if (t + 1) % 20 == 0:
-            print(f"[{t+1}/{T}] nonzero pos={int((prob_pos[t]>0).sum())} neg={int((prob_neg[t]>0).sum())}")
+        for (sl, region), pk in zip(metas, p_keep):
+            if pk >= TAU_KEEP:
+                block = prob_map[sl]
+                block[region] = np.maximum(block[region], float(pk))
+                prob_map[sl] = block
 
-    # 合成 0/1/2，冲突时取更大概率
+    run_one(pos_grow2d, prob_pos)
+    run_one(neg_grow2d, prob_neg)
+
+    pred = np.zeros((H,W), np.int8)
     pred[(prob_neg >= TAU_KEEP) & (prob_neg > prob_pos)] = 1
     pred[(prob_pos >= TAU_KEEP) & (prob_pos >= prob_neg)] = 2
+    return pred
 
-    os.makedirs(os.path.dirname(OUT_PRED) or ".", exist_ok=True)
-    np.save(OUT_PRED, pred)
-    print("Saved:", OUT_PRED, pred.shape)
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ssh = maybe_crop_to_roi(np.load(SSH_2011).astype(np.float32))
+    pg  = maybe_crop_to_roi(np.load(POS_GROW_2011).astype(np.uint8))
+    ng  = maybe_crop_to_roi(np.load(NEG_GROW_2011).astype(np.uint8))
+    oc  = maybe_crop_to_roi(np.load(OCEAN_2011).astype(np.uint8))
+    gt  = maybe_crop_to_roi(np.load(GT_2011).astype(np.int8))
+
+    net = SeedNet().to(device)
+    net.load_state_dict(torch.load(SEEDNET_PT, map_location="cpu"))
+    net.eval()
+
+    pred = predict_mask_for_day(net, ssh[DAY], pg[DAY], ng[DAY], oc[DAY], device)
+
+    
+    # 可视化：SSH、GT、Pred
+    fig, ax = plt.subplots(1,3, figsize=(12,4))
+    ax[0].imshow(ssh[DAY])
+    ax[0].set_title("SSH")
+    ax[1].imshow(gt[DAY], vmin=0, vmax=2)
+    ax[1].set_title("GT eddy_mask")
+    ax[2].imshow(pred, vmin=0, vmax=2)
+    ax[2].set_title(f"Pred (tau={TAU_KEEP})")
+    for a in ax: a.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+    def pr_f1_iou(pred, gt, cls):
+        tp = int(((pred == cls) & (gt == cls)).sum())
+        fp = int(((pred == cls) & (gt != cls)).sum())
+        fn = int(((pred != cls) & (gt == cls)).sum())
+        prec = tp / (tp + fp + 1e-9)
+        rec  = tp / (tp + fn + 1e-9)
+        f1   = 2 * prec * rec / (prec + rec + 1e-9)
+        iou  = tp / (tp + fp + fn + 1e-9)
+        return prec, rec, f1, iou, tp, fp, fn
+
+    def eval_one_day(pred, gt):
+        pos = pr_f1_iou(pred, gt, 2)
+        neg = pr_f1_iou(pred, gt, 1)
+
+        pred_e = (pred > 0).astype(np.uint8)
+        gt_e   = (gt > 0).astype(np.uint8)
+        eddy = pr_f1_iou(pred_e, gt_e, 1)
+
+        print(f"[POS] P={pos[0]:.3f} R={pos[1]:.3f} F1={pos[2]:.3f} IoU={pos[3]:.3f}  (tp={pos[4]}, fp={pos[5]}, fn={pos[6]})")
+        print(f"[NEG] P={neg[0]:.3f} R={neg[1]:.3f} F1={neg[2]:.3f} IoU={neg[3]:.3f}  (tp={neg[4]}, fp={neg[5]}, fn={neg[6]})")
+        print(f"[EDDY]P={eddy[0]:.3f} R={eddy[1]:.3f} F1={eddy[2]:.3f} IoU={eddy[3]:.3f}  (tp={eddy[4]}, fp={eddy[5]}, fn={eddy[6]})")
+
+    def plot_diff(pred, gt, title="Diff (yellow=FP, cyan=FN)"):
+    # FP: pred有但gt没有；FN: gt有但pred没有（以 eddy 二分类看）
+        pe = (pred > 0)
+        ge = (gt > 0)
+        fp = pe & (~ge)
+        fn = ge & (~pe)
+
+        img = np.zeros((*pred.shape, 3), dtype=np.float32)
+        img[fp] = [1, 1, 0]   # yellow
+        img[fn] = [0, 1, 1]   # cyan
+
+        plt.figure(figsize=(5,5))
+        plt.imshow(img)
+        plt.title(title)
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
 
 if __name__ == "__main__":
     main()
