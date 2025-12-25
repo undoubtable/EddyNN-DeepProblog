@@ -24,3 +24,5 @@ TestResults.xml
 *.npy
 
 *.csv
+
+*.npz
